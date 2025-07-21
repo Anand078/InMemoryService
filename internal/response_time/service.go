@@ -27,13 +27,21 @@ type Service struct {
 	// data holds all stored response time entries
 	data []ResponseTimeEntry
 	// mu protects concurrent access to the data slice
-	mu sync.Mutex
+	mu sync.RWMutex
+	// sortedCache holds sorted durations for faster percentile queries
+	sortedCache []int64
+	// cacheValid indicates if the sorted cache is up to date
+	cacheValid bool
 }
 
 // NewService creates and returns a new Service instance.
 // The returned service is ready to store response times and calculate percentiles.
 func NewService() *Service {
-	return &Service{data: make([]ResponseTimeEntry, 0)}
+	return &Service{
+		data:        make([]ResponseTimeEntry, 0, 1000), // Pre-allocate for better performance
+		sortedCache: make([]int64, 0, 1000),
+		cacheValid:  true,
+	}
 }
 
 // StoreResponseTime stores a response time entry in memory.
@@ -43,6 +51,8 @@ func NewService() *Service {
 // The function is thread-safe and can be called concurrently.
 // In a real-world scenario, this could fail due to out-of-memory conditions,
 // but for simplicity, it always succeeds unless the slice append fails.
+//
+// Performance: O(1) amortized time complexity
 //
 // Example:
 //
@@ -54,8 +64,13 @@ func NewService() *Service {
 func (s *Service) StoreResponseTime(ts time.Time, duration time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
 	entry := ResponseTimeEntry{Timestamp: ts, Duration: duration}
 	s.data = append(s.data, entry)
+
+	// Invalidate cache since we added new data
+	s.cacheValid = false
+
 	return nil
 }
 
@@ -64,8 +79,9 @@ func (s *Service) StoreResponseTime(ts time.Time, duration time.Duration) error 
 // For example, 90 returns the 90th percentile response time.
 //
 // The function uses the nearest-rank method for percentile calculation.
-// It sorts the stored durations in ascending order and returns the value
-// at the appropriate position based on the percentile.
+// It maintains a sorted cache for better performance on repeated queries.
+//
+// Performance: O(n log n) for first query, O(1) for subsequent queries with cache
 //
 // Returns an error if:
 //   - No data has been stored (empty dataset)
@@ -79,34 +95,75 @@ func (s *Service) StoreResponseTime(ts time.Time, duration time.Duration) error 
 //	}
 //	fmt.Printf("90th percentile: %v\n", p90)
 func (s *Service) GetResponseTime(percentile float64) (time.Duration, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
 
 	if len(s.data) == 0 {
+		s.mu.RUnlock()
 		return 0, errors.New("no data available")
 	}
 
 	if percentile < 0 || percentile > 100 {
+		s.mu.RUnlock()
 		return 0, errors.New("percentile must be between 0 and 100")
 	}
 
-	// Copy durations for sorting to avoid modifying the original data
-	durations := make([]int64, len(s.data))
-	for i, entry := range s.data {
-		durations[i] = int64(entry.Duration)
+	// Use cache if valid, otherwise rebuild it
+	if !s.cacheValid {
+		s.mu.RUnlock()
+		s.rebuildCache()
+		s.mu.RLock()
 	}
 
-	// Sort durations in ascending order
-	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
-
 	// Calculate the index for the nearest-rank method
-	idx := int((percentile/100.0)*float64(len(durations))) - 1
+	idx := int((percentile/100.0)*float64(len(s.sortedCache))) - 1
 	if idx < 0 {
 		idx = 0
 	}
-	if idx >= len(durations) {
-		idx = len(durations) - 1
+	if idx >= len(s.sortedCache) {
+		idx = len(s.sortedCache) - 1
 	}
 
-	return time.Duration(durations[idx]), nil
+	result := time.Duration(s.sortedCache[idx])
+	s.mu.RUnlock()
+
+	return result, nil
+}
+
+// rebuildCache rebuilds the sorted cache for faster percentile queries.
+// This is called when new data is added and the cache becomes invalid.
+func (s *Service) rebuildCache() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Reallocate cache if needed
+	if cap(s.sortedCache) < len(s.data) {
+		s.sortedCache = make([]int64, len(s.data))
+	} else {
+		s.sortedCache = s.sortedCache[:len(s.data)]
+	}
+
+	// Copy durations to cache
+	for i, entry := range s.data {
+		s.sortedCache[i] = int64(entry.Duration)
+	}
+
+	// Sort the cache
+	sort.Slice(s.sortedCache, func(i, j int) bool {
+		return s.sortedCache[i] < s.sortedCache[j]
+	})
+
+	s.cacheValid = true
+}
+
+// GetStats returns basic statistics about the stored data.
+// This is useful for monitoring and debugging.
+func (s *Service) GetStats() map[string]interface{} {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return map[string]interface{}{
+		"total_entries": len(s.data),
+		"cache_valid":   s.cacheValid,
+		"cache_size":    len(s.sortedCache),
+	}
 }
